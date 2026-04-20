@@ -88,7 +88,10 @@ detect_platform_family() {
     #       echo "TI AM62"
     #   elif echo "$model $compatible" | grep -qi 'rk3588'; then
     #       echo "Rockchip RK3588"
-    if echo "$model $compatible" | grep -qi 'imx8'; then
+
+    if echo "$model $compatible" | grep -qi 'imx93'; then
+        echo "i.MX93"
+    elif echo "$model $compatible" | grep -qi 'imx8'; then
         echo "i.MX8"
     elif echo "$model $compatible" | grep -qi 'imx6'; then
         echo "i.MX6"
@@ -215,6 +218,11 @@ load_power_profile() {
     fi
 
     case "$PLATFORM_FAMILY" in
+        "i.MX93")
+            [ -r "$SCRIPT_DIR/power_profiles/imx93.heuristic.conf" ] && \
+                RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/imx93.heuristic.conf"
+            ;;
+
         "i.MX6")
             [ -r "$SCRIPT_DIR/power_profiles/imx6.heuristic.conf" ] && \
                 RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/imx6.heuristic.conf"
