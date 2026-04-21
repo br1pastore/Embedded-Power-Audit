@@ -77,6 +77,48 @@ short_sys_path() {
     printf '%s' "$p"
 }
 
+parse_vcgencmd_temp_c() {
+    local raw="$1"
+    # temp=54.8'C
+    raw="${raw#temp=}"
+    raw="${raw%%\'C*}"
+    raw="${raw%%.*}"
+    if [[ "$raw" =~ ^-?[0-9]+$ ]]; then
+        echo "$raw"
+    else
+        echo -1
+    fi
+}
+
+parse_vcgencmd_clock_mhz() {
+    local raw="$1"
+    local hz
+    # frequency(48)=600000000
+    hz="${raw##*=}"
+    if [[ "$hz" =~ ^[0-9]+$ ]]; then
+        echo $((hz / 1000000))
+    else
+        echo 0
+    fi
+}
+
+parse_vcgencmd_throttled_hex() {
+    local raw="$1"
+    # throttled=0x50005
+    raw="${raw#throttled=}"
+    raw="${raw#0x}"
+    if [[ "$raw" =~ ^[0-9a-fA-F]+$ ]]; then
+        echo "$((16#$raw))"
+    else
+        echo 0
+    fi
+}
+
+bit_is_set() {
+    local value="$1"
+    local bit="$2"
+    [ $(( value & (1 << bit) )) -ne 0 ] && echo 1 || echo 0
+}
 
 detect_platform_family() {
     local model="$1"
@@ -89,7 +131,9 @@ detect_platform_family() {
     #   elif echo "$model $compatible" | grep -qi 'rk3588'; then
     #       echo "Rockchip RK3588"
 
-    if echo "$model $compatible" | grep -qi 'imx93'; then
+    if echo "$model $compatible" | grep -Eqi 'raspberry|bcm27'; then
+        echo "Raspberry Pi"
+    elif echo "$model $compatible" | grep -qi 'imx93'; then
         echo "i.MX93"
     elif echo "$model $compatible" | grep -qi 'imx8'; then
         echo "i.MX8"
@@ -218,6 +262,11 @@ load_power_profile() {
     fi
 
     case "$PLATFORM_FAMILY" in
+        "Raspberry Pi")
+            [ -r "$SCRIPT_DIR/power_profiles/raspberrypi.heuristic.conf" ] && \
+                RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/raspberrypi.heuristic.conf"
+            ;;
+
         "i.MX93")
             [ -r "$SCRIPT_DIR/power_profiles/imx93.heuristic.conf" ] && \
                 RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/imx93.heuristic.conf"
@@ -339,6 +388,41 @@ fi
 
 PLATFORM_FAMILY="$(detect_platform_family "$MODEL" "$COMPATIBLE")"
 
+RPI_VCGENCMD_PRESENT=0
+RPI_TEMP_C=-1
+RPI_ACTUAL_FREQ_MHZ=0
+RPI_THROTTLED_VALUE=0
+
+RPI_UNDERVOLT_NOW=0
+RPI_FREQ_CAPPED_NOW=0
+RPI_THROTTLED_NOW=0
+RPI_SOFT_TEMP_NOW=0
+RPI_UNDERVOLT_OCCURRED=0
+RPI_FREQ_CAPPED_OCCURRED=0
+RPI_THROTTLED_OCCURRED=0
+RPI_SOFT_TEMP_OCCURRED=0
+
+if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && command -v vcgencmd >/dev/null 2>&1; then
+    RPI_VCGENCMD_PRESENT=1
+
+    VC_TEMP_RAW="$(vcgencmd measure_temp 2>/dev/null)"
+    VC_CLOCK_RAW="$(vcgencmd measure_clock arm 2>/dev/null)"
+    VC_THROTTLED_RAW="$(vcgencmd get_throttled 2>/dev/null)"
+
+    RPI_TEMP_C="$(parse_vcgencmd_temp_c "$VC_TEMP_RAW")"
+    RPI_ACTUAL_FREQ_MHZ="$(parse_vcgencmd_clock_mhz "$VC_CLOCK_RAW")"
+    RPI_THROTTLED_VALUE="$(parse_vcgencmd_throttled_hex "$VC_THROTTLED_RAW")"
+
+    RPI_UNDERVOLT_NOW="$(bit_is_set "$RPI_THROTTLED_VALUE" 0)"
+    RPI_FREQ_CAPPED_NOW="$(bit_is_set "$RPI_THROTTLED_VALUE" 1)"
+    RPI_THROTTLED_NOW="$(bit_is_set "$RPI_THROTTLED_VALUE" 2)"
+    RPI_SOFT_TEMP_NOW="$(bit_is_set "$RPI_THROTTLED_VALUE" 3)"
+    RPI_UNDERVOLT_OCCURRED="$(bit_is_set "$RPI_THROTTLED_VALUE" 16)"
+    RPI_FREQ_CAPPED_OCCURRED="$(bit_is_set "$RPI_THROTTLED_VALUE" 17)"
+    RPI_THROTTLED_OCCURRED="$(bit_is_set "$RPI_THROTTLED_VALUE" 18)"
+    RPI_SOFT_TEMP_OCCURRED="$(bit_is_set "$RPI_THROTTLED_VALUE" 19)"
+fi
+
 CPU_FREQ_FILE="$(find_first_matching_file /sys/devices/system/cpu scaling_cur_freq)"
 CPU_GOV_FILE="$(find_first_matching_file /sys/devices/system/cpu scaling_governor)"
 CPU_AVAIL_FREQ_FILE="$(find_first_matching_file /sys/devices/system/cpu scaling_available_frequencies)"
@@ -423,6 +507,13 @@ FREQ_MHZ=0
 VOLT_MV=0
 [ "$FREQ" -gt 0 ] && FREQ_MHZ=$((FREQ / 1000))
 [ "$VOLT" -gt 0 ] && VOLT_MV=$((VOLT / 1000))
+
+REQUESTED_FREQ_MHZ="$FREQ_MHZ"
+
+if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ]; then
+    [ "$RPI_TEMP_C" -ge 0 ] && TEMP_C="$RPI_TEMP_C"
+    [ "$RPI_ACTUAL_FREQ_MHZ" -gt 0 ] && FREQ_MHZ="$RPI_ACTUAL_FREQ_MHZ"
+fi
 
 NET_BYTES_PREV="$(num_or_zero "$(sum_net_bytes)")"
 STORAGE_BYTES_PREV="$(num_or_zero "$(sum_storage_bytes_estimate)")"
@@ -630,14 +721,44 @@ elif [ "$GOV" != "powersave" ] && [ "$CPU_USAGE_PCT" -lt 20 ]; then
     SUGGESTIONS+=("CPU a basso carico (${CPU_USAGE_PCT}%). Valuta governor 'powersave' o policy equivalente per ridurre i consumi.")
 fi
 
+TEMP_WARN_MODERATE_LOCAL="$TEMP_WARN_MODERATE"
+TEMP_WARN_HIGH_LOCAL="$TEMP_WARN_HIGH"
+TEMP_WARN_CRIT_LOCAL="$TEMP_WARN_CRIT"
+
+if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ]; then
+    TEMP_WARN_MODERATE_LOCAL=70
+    TEMP_WARN_HIGH_LOCAL=80
+    TEMP_WARN_CRIT_LOCAL=85
+fi
+
 if [ "$TEMP_C" -lt 0 ]; then
-    SUGGESTIONS+=("Temperatura non disponibile: verificare thermal_zone, driver termico e contenuto di /sys/class/thermal/thermal_zone*/temp.")
-elif [ "$TEMP_C" -ge "$TEMP_WARN_CRIT" ]; then
+    SUGGESTIONS+=("Temperatura non disponibile: verificare thermal_zone o vcgencmd.")
+elif [ "$TEMP_C" -ge "$TEMP_WARN_CRIT_LOCAL" ]; then
     SUGGESTIONS+=("Temperatura alta (${TEMP_C}°C): possibile throttling o margine termico ridotto. Verificare dissipazione e carico.")
-elif [ "$TEMP_C" -ge "$TEMP_WARN_HIGH" ]; then
+elif [ "$TEMP_C" -ge "$TEMP_WARN_HIGH_LOCAL" ]; then
     SUGGESTIONS+=("Temperatura sostenuta (${TEMP_C}°C): controllare dissipazione, airflow e carico CPU/GPU.")
-elif [ "$TEMP_C" -ge "$TEMP_WARN_MODERATE" ]; then
+elif [ "$TEMP_C" -ge "$TEMP_WARN_MODERATE_LOCAL" ]; then
     SUGGESTIONS+=("Temperatura moderata (${TEMP_C}°C): monitorare il comportamento termico sotto carico prolungato.")
+fi
+
+if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ]; then
+    if [ "$RPI_UNDERVOLT_NOW" -eq 1 ]; then
+        SUGGESTIONS+=("Raspberry Pi: under-voltage rilevato adesso. Verificare alimentatore, cavo e cadute di tensione.")
+    elif [ "$RPI_UNDERVOLT_OCCURRED" -eq 1 ]; then
+        SUGGESTIONS+=("Raspberry Pi: eventi di under-voltage rilevati dal boot. Verificare alimentatore e cavo.")
+    fi
+
+    if [ "$RPI_FREQ_CAPPED_NOW" -eq 1 ] || [ "$RPI_FREQ_CAPPED_OCCURRED" -eq 1 ]; then
+        SUGGESTIONS+=("Raspberry Pi: frequency cap rilevato dal firmware. Controllare alimentazione e condizioni termiche.")
+    fi
+
+    if [ "$RPI_THROTTLED_NOW" -eq 1 ] || [ "$RPI_THROTTLED_OCCURRED" -eq 1 ]; then
+        SUGGESTIONS+=("Raspberry Pi: throttling rilevato dal firmware. Verificare temperatura, alimentazione e raffreddamento.")
+    fi
+
+    if [ "$RPI_SOFT_TEMP_NOW" -eq 1 ] || [ "$RPI_SOFT_TEMP_OCCURRED" -eq 1 ]; then
+        SUGGESTIONS+=("Raspberry Pi: soft temperature limit attivo o occorso. Migliorare dissipazione o ridurre il carico.")
+    fi
 fi
 
 if [ -z "$REGULATOR_FILE" ]; then
@@ -935,7 +1056,11 @@ else
         [ -n "$MODEL" ] && log "[SYSTEM] Model: $MODEL"
         [ -n "$TEMP_TYPE" ] && log "[SYSTEM] Thermal zone type: $TEMP_TYPE"
         log ""
-        log "[CPU] Freq: ${FREQ_MHZ} MHz  Governor: ${GOV:-n/d}  Usage: ${CPU_USAGE_PCT}%"
+        if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ]; then
+            log "[CPU] Requested freq: ${REQUESTED_FREQ_MHZ} MHz  Actual freq: ${FREQ_MHZ} MHz  Governor: ${GOV:-n/d}  Usage: ${CPU_USAGE_PCT}%"
+        else
+            log "[CPU] Freq: ${FREQ_MHZ} MHz  Governor: ${GOV:-n/d}  Usage: ${CPU_USAGE_PCT}%"
+        fi
 
         if [ -n "$REGULATOR_FILE" ]; then
             if [ "$REGULATOR_IS_CPU_LIKE" -eq 1 ]; then
@@ -953,6 +1078,10 @@ else
             log "[TEMP] temperatura non disponibile"
         fi
 
+        if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ]; then
+            log "[RPI THROTTLING] undervolt_now=$RPI_UNDERVOLT_NOW freq_capped_now=$RPI_FREQ_CAPPED_NOW throttled_now=$RPI_THROTTLED_NOW soft_temp_now=$RPI_SOFT_TEMP_NOW undervolt_occurred=$RPI_UNDERVOLT_OCCURRED freq_capped_occurred=$RPI_FREQ_CAPPED_OCCURRED throttled_occurred=$RPI_THROTTLED_OCCURRED soft_temp_occurred=$RPI_SOFT_TEMP_OCCURRED"
+        fi
+        
         log "[MEM] Used: ${mem_used_pct}%"
 
         log "[POWER ESTIMATE] Profile: $PROFILE_NAME  Total(est): ${EST_TOTAL_MW} mW"
