@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 # Embedded Linux power audit utility.
-# Current platform detection targets NXP i.MX6 / i.MX8, but the script name
-# and comments are intentionally generic so new SoC / SoM families can be
-# added without renaming the project.
+# Current platform detection targets NXP i.MX6 / i.MX8 / i.MX93,
+# Raspberry Pi, and Qualcomm Linux platforms including QRB2210 / Arduino UNO Q.
+# The script name and comments are intentionally generic so new SoC / SoM
+# families can be added without renaming the project.
 #
 # Usage:
 #   ./embedded_power_audit.sh
@@ -123,6 +124,7 @@ bit_is_set() {
 detect_platform_family() {
     local model="$1"
     local compatible="$2"
+    local soc_id="$3"
 
     # Extend this function with additional boards / SoC families.
     # Example:
@@ -131,13 +133,17 @@ detect_platform_family() {
     #   elif echo "$model $compatible" | grep -qi 'rk3588'; then
     #       echo "Rockchip RK3588"
 
-    if echo "$model $compatible" | grep -Eqi 'raspberry|bcm27'; then
+    if echo "$model $compatible $soc_id" | grep -Eqi 'arduino[ ,_-]*uno[ ,_-]*q|qrb2210|qcom,qrb2210'; then
+        echo "Qualcomm QRB2210"
+    elif echo "$model $compatible $soc_id" | grep -Eqi 'qualcomm|(^|[ ,])qcom[, -]'; then
+        echo "Qualcomm"
+    elif echo "$model $compatible $soc_id" | grep -Eqi 'raspberry|bcm27'; then
         echo "Raspberry Pi"
-    elif echo "$model $compatible" | grep -qi 'imx93'; then
+    elif echo "$model $compatible $soc_id" | grep -qi 'imx93'; then
         echo "i.MX93"
-    elif echo "$model $compatible" | grep -qi 'imx8'; then
+    elif echo "$model $compatible $soc_id" | grep -qi 'imx8'; then
         echo "i.MX8"
-    elif echo "$model $compatible" | grep -qi 'imx6'; then
+    elif echo "$model $compatible $soc_id" | grep -qi 'imx6'; then
         echo "i.MX6"
     else
         echo "unknown"
@@ -262,6 +268,16 @@ load_power_profile() {
     fi
 
     case "$PLATFORM_FAMILY" in
+        "Qualcomm QRB2210")
+            [ -r "$SCRIPT_DIR/power_profiles/qrb2210.heuristic.conf" ] && \
+                RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/qrb2210.heuristic.conf"
+            ;;
+
+        "Qualcomm")
+            [ -r "$SCRIPT_DIR/power_profiles/qualcomm.heuristic.conf" ] && \
+                RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/qualcomm.heuristic.conf"
+            ;;
+
         "Raspberry Pi")
             [ -r "$SCRIPT_DIR/power_profiles/raspberrypi.heuristic.conf" ] && \
                 RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/raspberrypi.heuristic.conf"
@@ -386,7 +402,30 @@ if [ -r /proc/device-tree/compatible ]; then
     COMPATIBLE="$(tr '\000' ' ' < /proc/device-tree/compatible)"
 fi
 
-PLATFORM_FAMILY="$(detect_platform_family "$MODEL" "$COMPATIBLE")"
+SOC_ID=""
+for soc_id_file in /sys/devices/soc0/soc_id /sys/devices/system/soc/soc0/id; do
+    if [ -r "$soc_id_file" ]; then
+        SOC_ID="$(safe_cat "$soc_id_file")"
+        [ -n "$SOC_ID" ] && break
+    fi
+done
+
+PLATFORM_FAMILY="$(detect_platform_family "$MODEL" "$COMPATIBLE" "$SOC_ID")"
+
+QCOM_DEVFREQ_COUNT=0
+QCOM_REMOTEPROC_COUNT=0
+QCOM_DEVFREQ_SAMPLE=""
+if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ] || [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
+    if [ -d /sys/class/devfreq ]; then
+        QCOM_DEVFREQ_COUNT="$(find /sys/class/devfreq -mindepth 1 -maxdepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')"
+        QCOM_DEVFREQ_COUNT="$(num_or_zero "$QCOM_DEVFREQ_COUNT")"
+        QCOM_DEVFREQ_SAMPLE="$(find /sys/class/devfreq -mindepth 1 -maxdepth 1 \( -type l -o -type d \) -printf '%f\n' 2>/dev/null | head -n 8)"
+    fi
+    if [ -d /sys/class/remoteproc ]; then
+        QCOM_REMOTEPROC_COUNT="$(find /sys/class/remoteproc -mindepth 1 -maxdepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')"
+        QCOM_REMOTEPROC_COUNT="$(num_or_zero "$QCOM_REMOTEPROC_COUNT")"
+    fi
+fi
 
 RPI_VCGENCMD_PRESENT=0
 RPI_TEMP_C=-1
@@ -434,7 +473,7 @@ for z in /sys/class/thermal/thermal_zone*; do
     [ -d "$z" ] || continue
     ttype="$(safe_cat "$z/type")"
     case "$ttype" in
-        *cpu*|*CPU*|*soc*|*SoC*|*imx*|*thermal*)
+        *cpu*|*CPU*|*soc*|*SoC*|*imx*|*qcom*|*tsens*|*thermal*)
             if [ -r "$z/temp" ]; then
                 TEMP_FILE="$z/temp"
                 break
@@ -586,7 +625,7 @@ USB_INTERRUPTS="$({
 
 DISPLAY_INTERRUPTS="$({
     awk 'BEGIN{IGNORECASE=1; sum=0}
-         /ipu|dpu|dcss|lcdif|mipi|drm|hdmi|lvds/ {
+         /ipu|dpu|dcss|lcdif|mipi|drm|hdmi|lvds|mdss|sde|dsi/ {
              for (i=2; i<=NF-1; i++) if ($i ~ /^[0-9]+$/) sum+=$i
          }
          END{print sum+0}' /proc/interrupts 2>/dev/null
@@ -622,7 +661,7 @@ for p in /sys/class/power_supply/*; do
     fi
 done
 
-NET_IRQS="$(grep -Ei 'eth|fec|eqos|stmmac|wifi|wlan|rtl|ath|brcm' /proc/interrupts 2>/dev/null || true)"
+NET_IRQS="$(grep -Ei 'eth|fec|eqos|stmmac|wifi|wlan|rtl|ath|brcm|cnss|wcn|ipa|rmnet|qrtr' /proc/interrupts 2>/dev/null || true)"
 
 # Runtime PM inventory
 RPM_TOTAL=0
@@ -761,6 +800,19 @@ if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ];
     fi
 fi
 
+if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ] || [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
+    if [ "$QCOM_DEVFREQ_COUNT" -gt 0 ]; then
+        SUGGESTIONS+=("Qualcomm: devfreq disponibile su ${QCOM_DEVFREQ_COUNT} device. Verificare governor e frequenze di GPU/DDR/interconnect durante idle e carico.")
+    fi
+
+    if grep -Eqi 'cnss|wcn|ipa|rmnet|qrtr' /proc/interrupts 2>/dev/null; then
+        SUGGESTIONS+=("Qualcomm: rilevate IRQ riconducibili a WLAN/modem/IPA/QRTR. Controllare che radio e servizi di connettività non necessari possano entrare in runtime suspend.")
+    fi
+
+    [ "$QCOM_REMOTEPROC_COUNT" -gt 0 ] && \
+        SUGGESTIONS+=("Qualcomm: ${QCOM_REMOTEPROC_COUNT} remoteproc rilevati. DSP/modem coprocessor possono incidere sul consumo anche con CPU A53 poco carica.")
+fi
+
 if [ -z "$REGULATOR_FILE" ]; then
     SUGGESTIONS+=("Nessun regolatore con microvolts leggibile: la telemetria PMIC può non essere esposta in sysfs su questa board.")
 elif [ "$REGULATOR_IS_CPU_LIKE" -eq 1 ] && [ "$REGULATOR_MV" -gt 1300 ]; then
@@ -872,8 +924,8 @@ fi
 load_power_profile "$PROFILE_FILE"
 
 read -r usb_active usb_total < <(count_runtime_matches '/sys/bus/usb/')
-read -r display_active display_total < <(count_runtime_matches 'drm|dcss|dpu|ipu|lcdif|mipi|hdmi|lvds')
-read -r audio_active audio_total < <(count_runtime_matches 'audio|sound|snd|i2s|sai|esai|spdif|pcm')
+read -r display_active display_total < <(count_runtime_matches 'drm|dcss|dpu|ipu|lcdif|mipi|hdmi|lvds|mdss|sde|dsi')
+read -r audio_active audio_total < <(count_runtime_matches 'audio|sound|snd|i2s|sai|esai|spdif|pcm|lpass|q6afe|q6asm')
 
 CPU_FREQ_RATIO_PCT=100
 if [ "$CPU_MAX_FREQ" -gt 0 ] && [ "$FREQ" -gt 0 ]; then
@@ -997,6 +1049,13 @@ if [ "$JSON_OUTPUT" -eq 1 ]; then
     printf '  "arch":"%s",\n' "$(json_escape "$ARCH")"
     printf '  "platform_family":"%s",\n' "$(json_escape "$PLATFORM_FAMILY")"
     printf '  "model":"%s",\n' "$(json_escape "$MODEL")"
+    printf '  "soc_id":"%s",\n' "$(json_escape "$SOC_ID")"
+    if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ] || [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
+        printf '  "qualcomm":{"devfreq_devices":%d,"remoteproc_devices":%d},\n' \
+            "$QCOM_DEVFREQ_COUNT" "$QCOM_REMOTEPROC_COUNT"
+    else
+        printf '  "qualcomm":null,\n'
+    fi
     printf '  "temp_zone_type":"%s",\n' "$(json_escape "$TEMP_TYPE")"
     printf '  "cpu":{"freq_mhz":%d,"governor":"%s","usage_pct":%d},\n' \
         "$FREQ_MHZ" "$(json_escape "${GOV:-unknown}")" "$CPU_USAGE_PCT"
@@ -1054,6 +1113,17 @@ else
         log "[SYSTEM] Kernel: $KERNEL  Arch: $ARCH  Uptime(s): ${UPTIME_STR:-n/d}"
         log "[SYSTEM] Platform: $PLATFORM_FAMILY"
         [ -n "$MODEL" ] && log "[SYSTEM] Model: $MODEL"
+        [ -n "$SOC_ID" ] && log "[SYSTEM] SoC ID: $SOC_ID"
+        if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ]; then
+            log "[SYSTEM] Qualcomm/Arduino Linux target detected (QRB2210 family)"
+            log "[QUALCOMM] devfreq devices: $QCOM_DEVFREQ_COUNT  remoteproc devices: $QCOM_REMOTEPROC_COUNT"
+            if [ -n "$QCOM_DEVFREQ_SAMPLE" ]; then
+                log "[QUALCOMM] devfreq sample: $(echo "$QCOM_DEVFREQ_SAMPLE" | tr '\n' ' ')"
+            fi
+        elif [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
+            log "[SYSTEM] Generic Qualcomm Linux target detected"
+            log "[QUALCOMM] devfreq devices: $QCOM_DEVFREQ_COUNT  remoteproc devices: $QCOM_REMOTEPROC_COUNT"
+        fi
         [ -n "$TEMP_TYPE" ] && log "[SYSTEM] Thermal zone type: $TEMP_TYPE"
         log ""
         if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ]; then
