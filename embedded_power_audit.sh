@@ -2,7 +2,8 @@
 
 # Embedded Linux power audit utility.
 # Current platform detection targets NXP i.MX6 / i.MX8 / i.MX93,
-# Raspberry Pi, and Qualcomm Linux platforms including QRB2210 / Arduino UNO Q.
+# Raspberry Pi, Qualcomm Linux platforms including QRB2210 / Arduino UNO Q,
+# and Xilinx Zynq-7000 platforms such as MicroZed / ZedBoard / Som-my.
 # The script name and comments are intentionally generic so new SoC / SoM
 # families can be added without renaming the project.
 #
@@ -121,6 +122,47 @@ bit_is_set() {
     [ $(( value & (1 << bit) )) -ne 0 ] && echo 1 || echo 0
 }
 
+read_xilinx_xadc_temp_c() {
+    local d name raw offset scale
+
+    for d in /sys/bus/iio/devices/iio:device*; do
+        [ -d "$d" ] || continue
+
+        name="$(safe_cat "$d/name")"
+        case "$name" in
+            xadc|*xadc*|*sysmon*)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        [ -r "$d/in_temp0_raw" ] || continue
+        [ -r "$d/in_temp0_scale" ] || continue
+
+        raw="$(safe_cat "$d/in_temp0_raw")"
+        offset="$(safe_cat "$d/in_temp0_offset")"
+        scale="$(safe_cat "$d/in_temp0_scale")"
+        [ -n "$offset" ] || offset=0
+
+        # Xilinx XADC uses the IIO convention:
+        # temperature[m°C] = (raw + offset) * scale
+        if awk -v r="$raw" -v o="$offset" -v s="$scale" '
+            BEGIN {
+                if (r !~ /^-?[0-9]+([.][0-9]+)?$/ ||
+                    o !~ /^-?[0-9]+([.][0-9]+)?$/ ||
+                    s !~ /^-?[0-9]+([.][0-9]+)?$/)
+                    exit 1
+                temp = ((r + o) * s) / 1000.0
+                printf "%.0f\n", temp
+            }'; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 detect_platform_family() {
     local model="$1"
     local compatible="$2"
@@ -145,6 +187,8 @@ detect_platform_family() {
         echo "i.MX8"
     elif echo "$model $compatible $soc_id" | grep -qi 'imx6'; then
         echo "i.MX6"
+    elif echo "$model $compatible" | grep -Eqi 'microzed|zedboard|zynq-7000|xlnx,zynq'; then
+        echo "Xilinx Zynq-7000"
     else
         echo "unknown"
     fi
@@ -534,12 +578,25 @@ if [ "$CPU_MAX_FREQ" -eq 0 ]; then
     CPU_MAX_FREQ="$(max_from_list "$CPU_SCALING_AVAILABLE")"
 fi
 
-TEMP_RAW="$(num_or_zero "$(safe_cat "$TEMP_FILE")")"
 TEMP_C=-1
+TEMP_SOURCE=""
+TEMP_RAW="$(num_or_zero "$(safe_cat "$TEMP_FILE")")"
 if [ "$TEMP_RAW" -ge 1000 ]; then
     TEMP_C=$((TEMP_RAW / 1000))
+    TEMP_SOURCE="thermal:${TEMP_TYPE:-unknown}"
 elif [ "$TEMP_RAW" -gt 0 ]; then
     TEMP_C=$TEMP_RAW
+    TEMP_SOURCE="thermal:${TEMP_TYPE:-unknown}"
+fi
+
+# Xilinx Zynq-7000 commonly exposes die temperature through XADC/IIO
+# rather than /sys/class/thermal. Use it only as a fallback.
+if [ "$TEMP_C" -lt 0 ]; then
+    IIO_TEMP="$(read_xilinx_xadc_temp_c 2>/dev/null || true)"
+    if [[ "$IIO_TEMP" =~ ^-?[0-9]+$ ]]; then
+        TEMP_C="$IIO_TEMP"
+        TEMP_SOURCE="iio:xadc"
+    fi
 fi
 
 FREQ_MHZ=0
@@ -550,7 +607,10 @@ VOLT_MV=0
 REQUESTED_FREQ_MHZ="$FREQ_MHZ"
 
 if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ]; then
-    [ "$RPI_TEMP_C" -ge 0 ] && TEMP_C="$RPI_TEMP_C"
+    if [ "$RPI_TEMP_C" -ge 0 ]; then
+        TEMP_C="$RPI_TEMP_C"
+        TEMP_SOURCE="vcgencmd"
+    fi
     [ "$RPI_ACTUAL_FREQ_MHZ" -gt 0 ] && FREQ_MHZ="$RPI_ACTUAL_FREQ_MHZ"
 fi
 
@@ -585,11 +645,18 @@ fi
 
 IDLE_INFO=""
 CPUIDLE_BASE=""
-if [ -d /sys/devices/system/cpu/cpuidle ]; then
-    CPUIDLE_BASE="/sys/devices/system/cpu/cpuidle"
-elif [ -d /sys/devices/system/cpu/cpu0/cpuidle ]; then
-    CPUIDLE_BASE="/sys/devices/system/cpu/cpu0/cpuidle"
-fi
+for candidate in \
+    /sys/devices/system/cpu/cpu0/cpuidle \
+    /sys/devices/system/cpu/cpuidle
+do
+    [ -d "$candidate" ] || continue
+    for s in "$candidate"/state*; do
+        if [ -d "$s" ]; then
+            CPUIDLE_BASE="$candidate"
+            break 2
+        fi
+    done
+done
 
 if [ -n "$CPUIDLE_BASE" ]; then
     for s in "$CPUIDLE_BASE"/state*; do
@@ -771,7 +838,7 @@ if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ]; then
 fi
 
 if [ "$TEMP_C" -lt 0 ]; then
-    SUGGESTIONS+=("Temperatura non disponibile: verificare thermal_zone o vcgencmd.")
+    SUGGESTIONS+=("Temperatura non disponibile: verificare thermal_zone, XADC/IIO o telemetria specifica della piattaforma (es. vcgencmd).")
 elif [ "$TEMP_C" -ge "$TEMP_WARN_CRIT_LOCAL" ]; then
     SUGGESTIONS+=("Temperatura alta (${TEMP_C}°C): possibile throttling o margine termico ridotto. Verificare dissipazione e carico.")
 elif [ "$TEMP_C" -ge "$TEMP_WARN_HIGH_LOCAL" ]; then
@@ -1057,6 +1124,7 @@ if [ "$JSON_OUTPUT" -eq 1 ]; then
         printf '  "qualcomm":null,\n'
     fi
     printf '  "temp_zone_type":"%s",\n' "$(json_escape "$TEMP_TYPE")"
+    printf '  "temp_source":"%s",\n' "$(json_escape "$TEMP_SOURCE")"
     printf '  "cpu":{"freq_mhz":%d,"governor":"%s","usage_pct":%d},\n' \
         "$FREQ_MHZ" "$(json_escape "${GOV:-unknown}")" "$CPU_USAGE_PCT"
 
@@ -1143,7 +1211,11 @@ else
         fi
 
         if [ "$TEMP_C" -ge 0 ]; then
-            log "[TEMP] ${TEMP_C} °C"
+            if [ -n "$TEMP_SOURCE" ]; then
+                log "[TEMP] ${TEMP_C} °C  (source: $TEMP_SOURCE)"
+            else
+                log "[TEMP] ${TEMP_C} °C"
+            fi
         else
             log "[TEMP] temperatura non disponibile"
         fi
