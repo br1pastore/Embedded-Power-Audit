@@ -2,8 +2,9 @@
 
 # Embedded Linux power audit utility.
 # Current platform detection targets NXP i.MX6 / i.MX8 / i.MX93,
-# Raspberry Pi, Qualcomm Linux platforms including QRB2210 / Arduino UNO Q,
-# and Xilinx Zynq-7000 platforms such as MicroZed / ZedBoard / Som-my.
+# Raspberry Pi, Qualcomm Linux platforms including QRB2210 / Arduino UNO Q
+# and Dragonwing IQ8 / QCS8275 (e.g. Toradex Aquila IQ8), plus Xilinx
+# Zynq-7000 platforms such as MicroZed / ZedBoard.
 # The script name and comments are intentionally generic so new SoC / SoM
 # families can be added without renaming the project.
 #
@@ -175,7 +176,9 @@ detect_platform_family() {
     #   elif echo "$model $compatible" | grep -qi 'rk3588'; then
     #       echo "Rockchip RK3588"
 
-    if echo "$model $compatible $soc_id" | grep -Eqi 'arduino[ ,_-]*uno[ ,_-]*q|qrb2210|qcom,qrb2210'; then
+    if echo "$model $compatible $soc_id" | grep -Eqi 'aquila[ ,_-]*iq8|iq[ ,_-]*8275|qcs8275|qcom,qcs8275|dragonwing[ ,_-]*iq8'; then
+        echo "Qualcomm Dragonwing IQ8"
+    elif echo "$model $compatible $soc_id" | grep -Eqi 'arduino[ ,_-]*uno[ ,_-]*q|qrb2210|qcom,qrb2210'; then
         echo "Qualcomm QRB2210"
     elif echo "$model $compatible $soc_id" | grep -Eqi 'qualcomm|(^|[ ,])qcom[, -]'; then
         echo "Qualcomm"
@@ -192,6 +195,13 @@ detect_platform_family() {
     else
         echo "unknown"
     fi
+}
+
+is_qualcomm_platform() {
+    case "$PLATFORM_FAMILY" in
+        Qualcomm*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 clamp_pct() {
@@ -312,6 +322,11 @@ load_power_profile() {
     fi
 
     case "$PLATFORM_FAMILY" in
+        "Qualcomm Dragonwing IQ8")
+            [ -r "$SCRIPT_DIR/power_profiles/qcs8275.heuristic.conf" ] && \
+                RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/qcs8275.heuristic.conf"
+            ;;
+
         "Qualcomm QRB2210")
             [ -r "$SCRIPT_DIR/power_profiles/qrb2210.heuristic.conf" ] && \
                 RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/qrb2210.heuristic.conf"
@@ -459,15 +474,41 @@ PLATFORM_FAMILY="$(detect_platform_family "$MODEL" "$COMPATIBLE" "$SOC_ID")"
 QCOM_DEVFREQ_COUNT=0
 QCOM_REMOTEPROC_COUNT=0
 QCOM_DEVFREQ_SAMPLE=""
-if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ] || [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
+QCOM_DEVFREQ_INFO=""
+QCOM_REMOTEPROC_INFO=""
+if is_qualcomm_platform; then
     if [ -d /sys/class/devfreq ]; then
         QCOM_DEVFREQ_COUNT="$(find /sys/class/devfreq -mindepth 1 -maxdepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')"
         QCOM_DEVFREQ_COUNT="$(num_or_zero "$QCOM_DEVFREQ_COUNT")"
         QCOM_DEVFREQ_SAMPLE="$(find /sys/class/devfreq -mindepth 1 -maxdepth 1 \( -type l -o -type d \) -printf '%f\n' 2>/dev/null | head -n 8)"
+
+        qcom_df_seen=0
+        for qcom_df in /sys/class/devfreq/*; do
+            [ -e "$qcom_df" ] || continue
+            [ "$qcom_df_seen" -lt 8 ] || break
+            qcom_df_name="$(basename "$qcom_df")"
+            qcom_df_cur="$(safe_cat "$qcom_df/cur_freq")"
+            [ -n "$qcom_df_cur" ] || qcom_df_cur="$(safe_cat "$qcom_df/current_frequency")"
+            qcom_df_min="$(safe_cat "$qcom_df/min_freq")"
+            qcom_df_max="$(safe_cat "$qcom_df/max_freq")"
+            qcom_df_gov="$(safe_cat "$qcom_df/governor")"
+            QCOM_DEVFREQ_INFO+="$qcom_df_name|cur=${qcom_df_cur:-n/d}|min=${qcom_df_min:-n/d}|max=${qcom_df_max:-n/d}|governor=${qcom_df_gov:-n/d}"$'\n'
+            qcom_df_seen=$((qcom_df_seen + 1))
+        done
     fi
     if [ -d /sys/class/remoteproc ]; then
         QCOM_REMOTEPROC_COUNT="$(find /sys/class/remoteproc -mindepth 1 -maxdepth 1 \( -type l -o -type d \) 2>/dev/null | wc -l | tr -d ' ')"
         QCOM_REMOTEPROC_COUNT="$(num_or_zero "$QCOM_REMOTEPROC_COUNT")"
+
+        qcom_rp_seen=0
+        for qcom_rp in /sys/class/remoteproc/remoteproc*; do
+            [ -d "$qcom_rp" ] || continue
+            [ "$qcom_rp_seen" -lt 8 ] || break
+            qcom_rp_name="$(safe_cat "$qcom_rp/name")"
+            qcom_rp_state="$(safe_cat "$qcom_rp/state")"
+            QCOM_REMOTEPROC_INFO+="$(basename "$qcom_rp")|name=${qcom_rp_name:-n/d}|state=${qcom_rp_state:-n/d}"$'\n'
+            qcom_rp_seen=$((qcom_rp_seen + 1))
+        done
     fi
 fi
 
@@ -511,6 +552,60 @@ CPU_GOV_FILE="$(find_first_matching_file /sys/devices/system/cpu scaling_governo
 CPU_AVAIL_FREQ_FILE="$(find_first_matching_file /sys/devices/system/cpu scaling_available_frequencies)"
 CPU_TIME_IN_STATE_FILE="$(find_first_matching_file /sys/devices/system/cpu time_in_state)"
 CPU_MAX_FREQ_FILE="$(find_first_matching_file /sys/devices/system/cpu cpuinfo_max_freq)"
+
+# Modern heterogeneous SoCs can expose multiple CPUFreq policies (for example
+# separate efficiency/performance clusters). Keep the legacy single-file
+# values as a fallback, but inventory all policies when available.
+CPU_POLICY_COUNT=0
+CPU_POLICY_INFO=""
+CPU_POLICY_FREQ_RATIO_SUM=0
+CPU_POLICY_FREQ_RATIO_COUNT=0
+CPU_POLICY_FREQ_RATIO_AVG=0
+CPU_POLICY_MAX_CUR_KHZ=0
+CPU_POLICY_MAX_FREQ_KHZ=0
+CPU_POLICY_GOV_FIRST=""
+CPU_POLICY_GOV_MIXED=0
+
+for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -d "$policy" ] || continue
+
+    policy_name="$(basename "$policy")"
+    policy_cpus="$(safe_cat "$policy/related_cpus")"
+    [ -n "$policy_cpus" ] || policy_cpus="$(safe_cat "$policy/affected_cpus")"
+    policy_cur="$(num_or_zero "$(safe_cat "$policy/scaling_cur_freq")")"
+    policy_max="$(num_or_zero "$(safe_cat "$policy/cpuinfo_max_freq")")"
+    [ "$policy_max" -gt 0 ] || policy_max="$(num_or_zero "$(safe_cat "$policy/scaling_max_freq")")"
+    policy_gov="$(safe_cat "$policy/scaling_governor")"
+
+    CPU_POLICY_COUNT=$((CPU_POLICY_COUNT + 1))
+    [ "$policy_cur" -gt "$CPU_POLICY_MAX_CUR_KHZ" ] && CPU_POLICY_MAX_CUR_KHZ="$policy_cur"
+    [ "$policy_max" -gt "$CPU_POLICY_MAX_FREQ_KHZ" ] && CPU_POLICY_MAX_FREQ_KHZ="$policy_max"
+
+    if [ -z "$CPU_POLICY_GOV_FIRST" ] && [ -n "$policy_gov" ]; then
+        CPU_POLICY_GOV_FIRST="$policy_gov"
+    elif [ -n "$policy_gov" ] && [ -n "$CPU_POLICY_GOV_FIRST" ] && [ "$policy_gov" != "$CPU_POLICY_GOV_FIRST" ]; then
+        CPU_POLICY_GOV_MIXED=1
+    fi
+
+    if [ "$policy_cur" -gt 0 ] && [ "$policy_max" -gt 0 ]; then
+        policy_ratio=$((100 * policy_cur / policy_max))
+        policy_ratio="$(clamp_pct "$policy_ratio")"
+        CPU_POLICY_FREQ_RATIO_SUM=$((CPU_POLICY_FREQ_RATIO_SUM + policy_ratio))
+        CPU_POLICY_FREQ_RATIO_COUNT=$((CPU_POLICY_FREQ_RATIO_COUNT + 1))
+    else
+        policy_ratio=0
+    fi
+
+    policy_cur_mhz=0
+    policy_max_mhz=0
+    [ "$policy_cur" -gt 0 ] && policy_cur_mhz=$((policy_cur / 1000))
+    [ "$policy_max" -gt 0 ] && policy_max_mhz=$((policy_max / 1000))
+    CPU_POLICY_INFO+="$policy_name|cpus=${policy_cpus:-n/d}|cur_mhz=$policy_cur_mhz|max_mhz=$policy_max_mhz|governor=${policy_gov:-n/d}|ratio_pct=$policy_ratio"$'\n'
+done
+
+if [ "$CPU_POLICY_FREQ_RATIO_COUNT" -gt 0 ]; then
+    CPU_POLICY_FREQ_RATIO_AVG=$((CPU_POLICY_FREQ_RATIO_SUM / CPU_POLICY_FREQ_RATIO_COUNT))
+fi
 
 TEMP_FILE=""
 for z in /sys/class/thermal/thermal_zone*; do
@@ -576,6 +671,18 @@ MEM_FREE="$(num_or_zero "$MEM_FREE")"
 
 if [ "$CPU_MAX_FREQ" -eq 0 ]; then
     CPU_MAX_FREQ="$(max_from_list "$CPU_SCALING_AVAILABLE")"
+fi
+
+CPU_FREQ_SOURCE="legacy"
+if [ "$CPU_POLICY_COUNT" -gt 0 ]; then
+    CPU_FREQ_SOURCE="cpufreq-policy"
+    [ "$CPU_POLICY_MAX_CUR_KHZ" -gt 0 ] && FREQ="$CPU_POLICY_MAX_CUR_KHZ"
+    [ "$CPU_POLICY_MAX_FREQ_KHZ" -gt 0 ] && CPU_MAX_FREQ="$CPU_POLICY_MAX_FREQ_KHZ"
+    if [ "$CPU_POLICY_GOV_MIXED" -eq 1 ]; then
+        GOV="mixed"
+    elif [ -n "$CPU_POLICY_GOV_FIRST" ]; then
+        GOV="$CPU_POLICY_GOV_FIRST"
+    fi
 fi
 
 TEMP_C=-1
@@ -867,7 +974,7 @@ if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ];
     fi
 fi
 
-if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ] || [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
+if is_qualcomm_platform; then
     if [ "$QCOM_DEVFREQ_COUNT" -gt 0 ]; then
         SUGGESTIONS+=("Qualcomm: devfreq disponibile su ${QCOM_DEVFREQ_COUNT} device. Verificare governor e frequenze di GPU/DDR/interconnect durante idle e carico.")
     fi
@@ -877,7 +984,11 @@ if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ] || [ "$PLATFORM_FAMILY" = "Qualco
     fi
 
     [ "$QCOM_REMOTEPROC_COUNT" -gt 0 ] && \
-        SUGGESTIONS+=("Qualcomm: ${QCOM_REMOTEPROC_COUNT} remoteproc rilevati. DSP/modem coprocessor possono incidere sul consumo anche con CPU A53 poco carica.")
+        SUGGESTIONS+=("Qualcomm: ${QCOM_REMOTEPROC_COUNT} remoteproc rilevati. DSP/NPU/modem e altri coprocessori possono incidere sul consumo anche con CPU applicative poco cariche.")
+
+    if [ "$PLATFORM_FAMILY" = "Qualcomm Dragonwing IQ8" ] && [ "$CPU_POLICY_COUNT" -gt 1 ]; then
+        SUGGESTIONS+=("Dragonwing IQ8: rilevate ${CPU_POLICY_COUNT} policy CPUFreq. Valutare separatamente i cluster durante idle e carico per verificare DVFS e residency alle basse frequenze.")
+    fi
 fi
 
 if [ -z "$REGULATOR_FILE" ]; then
@@ -995,7 +1106,11 @@ read -r display_active display_total < <(count_runtime_matches 'drm|dcss|dpu|ipu
 read -r audio_active audio_total < <(count_runtime_matches 'audio|sound|snd|i2s|sai|esai|spdif|pcm|lpass|q6afe|q6asm')
 
 CPU_FREQ_RATIO_PCT=100
-if [ "$CPU_MAX_FREQ" -gt 0 ] && [ "$FREQ" -gt 0 ]; then
+if [ "$CPU_POLICY_FREQ_RATIO_COUNT" -gt 0 ]; then
+    # Average the per-policy frequency ratios. This is more representative on
+    # heterogeneous multi-cluster SoCs than using one arbitrary policy.
+    CPU_FREQ_RATIO_PCT="$(clamp_pct "$CPU_POLICY_FREQ_RATIO_AVG")"
+elif [ "$CPU_MAX_FREQ" -gt 0 ] && [ "$FREQ" -gt 0 ]; then
     CPU_FREQ_RATIO_PCT=$((100 * FREQ / CPU_MAX_FREQ))
     CPU_FREQ_RATIO_PCT="$(clamp_pct "$CPU_FREQ_RATIO_PCT")"
 fi
@@ -1117,16 +1232,18 @@ if [ "$JSON_OUTPUT" -eq 1 ]; then
     printf '  "platform_family":"%s",\n' "$(json_escape "$PLATFORM_FAMILY")"
     printf '  "model":"%s",\n' "$(json_escape "$MODEL")"
     printf '  "soc_id":"%s",\n' "$(json_escape "$SOC_ID")"
-    if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ] || [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
-        printf '  "qualcomm":{"devfreq_devices":%d,"remoteproc_devices":%d},\n' \
-            "$QCOM_DEVFREQ_COUNT" "$QCOM_REMOTEPROC_COUNT"
+    if is_qualcomm_platform; then
+        printf '  "qualcomm":{"devfreq_devices":%d,"remoteproc_devices":%d,"devfreq_summary":"%s","remoteproc_summary":"%s"},\n' \
+            "$QCOM_DEVFREQ_COUNT" "$QCOM_REMOTEPROC_COUNT" \
+            "$(json_escape "$QCOM_DEVFREQ_INFO")" "$(json_escape "$QCOM_REMOTEPROC_INFO")"
     else
         printf '  "qualcomm":null,\n'
     fi
     printf '  "temp_zone_type":"%s",\n' "$(json_escape "$TEMP_TYPE")"
     printf '  "temp_source":"%s",\n' "$(json_escape "$TEMP_SOURCE")"
-    printf '  "cpu":{"freq_mhz":%d,"governor":"%s","usage_pct":%d},\n' \
-        "$FREQ_MHZ" "$(json_escape "${GOV:-unknown}")" "$CPU_USAGE_PCT"
+    printf '  "cpu":{"freq_mhz":%d,"governor":"%s","usage_pct":%d,"policy_count":%d,"freq_source":"%s","policy_summary":"%s"},\n' \
+        "$FREQ_MHZ" "$(json_escape "${GOV:-unknown}")" "$CPU_USAGE_PCT" "$CPU_POLICY_COUNT" \
+        "$(json_escape "$CPU_FREQ_SOURCE")" "$(json_escape "$CPU_POLICY_INFO")"
 
     if [ -n "$REGULATOR_FILE" ]; then
         printf '  "regulator_sample":{"name":"%s","mv":%d,"cpu_like":%d},\n' \
@@ -1182,22 +1299,47 @@ else
         log "[SYSTEM] Platform: $PLATFORM_FAMILY"
         [ -n "$MODEL" ] && log "[SYSTEM] Model: $MODEL"
         [ -n "$SOC_ID" ] && log "[SYSTEM] SoC ID: $SOC_ID"
-        if [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ]; then
+        if [ "$PLATFORM_FAMILY" = "Qualcomm Dragonwing IQ8" ]; then
+            log "[SYSTEM] Qualcomm Dragonwing IQ8 / QCS8275 target detected"
+            log "[QUALCOMM] devfreq devices: $QCOM_DEVFREQ_COUNT  remoteproc devices: $QCOM_REMOTEPROC_COUNT"
+        elif [ "$PLATFORM_FAMILY" = "Qualcomm QRB2210" ]; then
             log "[SYSTEM] Qualcomm/Arduino Linux target detected (QRB2210 family)"
             log "[QUALCOMM] devfreq devices: $QCOM_DEVFREQ_COUNT  remoteproc devices: $QCOM_REMOTEPROC_COUNT"
-            if [ -n "$QCOM_DEVFREQ_SAMPLE" ]; then
-                log "[QUALCOMM] devfreq sample: $(echo "$QCOM_DEVFREQ_SAMPLE" | tr '\n' ' ')"
-            fi
         elif [ "$PLATFORM_FAMILY" = "Qualcomm" ]; then
             log "[SYSTEM] Generic Qualcomm Linux target detected"
             log "[QUALCOMM] devfreq devices: $QCOM_DEVFREQ_COUNT  remoteproc devices: $QCOM_REMOTEPROC_COUNT"
+        fi
+        if is_qualcomm_platform; then
+            if [ -n "$QCOM_DEVFREQ_INFO" ]; then
+                log "[QUALCOMM DEVFREQ]"
+                while IFS= read -r qline; do
+                    [ -n "$qline" ] || continue
+                    log "  $qline"
+                done <<< "$QCOM_DEVFREQ_INFO"
+            fi
+            if [ -n "$QCOM_REMOTEPROC_INFO" ]; then
+                log "[QUALCOMM REMOTEPROC]"
+                while IFS= read -r qline; do
+                    [ -n "$qline" ] || continue
+                    log "  $qline"
+                done <<< "$QCOM_REMOTEPROC_INFO"
+            fi
         fi
         [ -n "$TEMP_TYPE" ] && log "[SYSTEM] Thermal zone type: $TEMP_TYPE"
         log ""
         if [ "$PLATFORM_FAMILY" = "Raspberry Pi" ] && [ "$RPI_VCGENCMD_PRESENT" -eq 1 ]; then
             log "[CPU] Requested freq: ${REQUESTED_FREQ_MHZ} MHz  Actual freq: ${FREQ_MHZ} MHz  Governor: ${GOV:-n/d}  Usage: ${CPU_USAGE_PCT}%"
+        elif [ "$CPU_POLICY_COUNT" -gt 1 ]; then
+            log "[CPU] Usage: ${CPU_USAGE_PCT}%  CPUFreq policies: $CPU_POLICY_COUNT  Avg freq ratio: ${CPU_POLICY_FREQ_RATIO_AVG}%"
+            while IFS= read -r pline; do
+                [ -n "$pline" ] || continue
+                log "  $pline"
+            done <<< "$CPU_POLICY_INFO"
         else
             log "[CPU] Freq: ${FREQ_MHZ} MHz  Governor: ${GOV:-n/d}  Usage: ${CPU_USAGE_PCT}%"
+            if [ "$CPU_POLICY_COUNT" -eq 1 ] && [ -n "$CPU_POLICY_INFO" ]; then
+                log "[CPU POLICY] $(printf '%s' "$CPU_POLICY_INFO" | head -n 1)"
+            fi
         fi
 
         if [ -n "$REGULATOR_FILE" ]; then
