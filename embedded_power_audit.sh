@@ -176,7 +176,11 @@ detect_platform_family() {
     #   elif echo "$model $compatible" | grep -qi 'rk3588'; then
     #       echo "Rockchip RK3588"
 
-    if echo "$model $compatible $soc_id" | grep -Eqi 'aquila[ ,_-]*iq8|iq[ ,_-]*8275|qcs8275|qcom,qcs8275|dragonwing[ ,_-]*iq8'; then
+    if echo "$model $compatible $soc_id" | grep -Eqi 'genio[ ,_-]*(720|g720)|mt8391|mediatek,mt8391'; then
+        echo "MediaTek Genio 720"
+    elif echo "$model $compatible $soc_id" | grep -Eqi 'genio[ ,_-]*(520|g520)|mt8371|mediatek,mt8371'; then
+        echo "MediaTek Genio 520"
+    elif echo "$model $compatible $soc_id" | grep -Eqi 'aquila[ ,_-]*iq8|iq[ ,_-]*8275|qcs8275|qcom,qcs8275|dragonwing[ ,_-]*iq8'; then
         echo "Qualcomm Dragonwing IQ8"
     elif echo "$model $compatible $soc_id" | grep -Eqi 'arduino[ ,_-]*uno[ ,_-]*q|qrb2210|qcom,qrb2210'; then
         echo "Qualcomm QRB2210"
@@ -354,6 +358,15 @@ load_power_profile() {
         "i.MX8")
             [ -r "$SCRIPT_DIR/power_profiles/imx8.heuristic.conf" ] && \
                 RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/imx8.heuristic.conf"
+            ;;
+        "MediaTek Genio 720")
+            [ -r "$SCRIPT_DIR/power_profiles/mediatek-genio720.heuristic.conf" ] && \
+                RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/mediatek-genio720.heuristic.conf"
+            ;;
+
+        "MediaTek Genio 520")
+            [ -r "$SCRIPT_DIR/power_profiles/mediatek-genio520.heuristic.conf" ] && \
+                RECOMMENDED_PROFILE="$SCRIPT_DIR/power_profiles/mediatek-genio520.heuristic.conf"
             ;;
     esac
 
